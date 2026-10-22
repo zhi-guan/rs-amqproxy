@@ -1,6 +1,7 @@
 //! 黑盒测试：只运行 `amqproxy` 二进制，检查退出码和输出。
 
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 fn run(args: &[&str], envs: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_amqproxy"));
@@ -11,7 +12,15 @@ fn run(args: &[&str], envs: &[(&str, &str)]) -> Output {
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    cmd.output().unwrap()
+    // 配置正确时代理会一直运行：给它一点时间打印日志，然后终止。
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline && child.try_wait().unwrap().is_none() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    child.wait_with_output().unwrap()
 }
 
 fn stdout(o: &Output) -> String {
@@ -71,7 +80,6 @@ fn url_without_host_fails() {
 #[test]
 fn defaults_are_localhost_5673_and_amqp_5672() {
     let o = run(&["amqp://broker.example.com"], &[]);
-    assert!(o.status.success(), "{}", stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("upstream=broker.example.com:5672"), "{out}");
     assert!(out.contains("tls=false"), "{out}");
@@ -114,7 +122,6 @@ fn environment_variables_configure_the_proxy() {
             ("LISTEN_PORT", "7000"),
         ],
     );
-    assert!(o.status.success(), "{}", stderr(&o));
     let out = stdout(&o);
     assert!(out.contains("upstream=env.example.com:5672"), "{out}");
     assert!(out.contains("listen=0.0.0.0:7000"), "{out}");

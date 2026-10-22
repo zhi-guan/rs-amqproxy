@@ -124,3 +124,89 @@ impl Frame {
         out.put_u8(FRAME_END);
     }
 }
+
+// ---------- 异步读写 ----------
+
+use std::io;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+#[derive(Debug)]
+pub enum ReadError {
+    Io(io::Error),
+    Frame(FrameError),
+    /// 连接在一个帧的中间被关闭。
+    UnexpectedEof,
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::Io(e) => write!(f, "read error: {e}"),
+            ReadError::Frame(e) => write!(f, "{e}"),
+            ReadError::UnexpectedEof => write!(f, "connection closed in the middle of a frame"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+/// 带缓冲的帧读取器。`read_frame` 可以安全地用在 `select!` 中：被取消时，
+/// 已经读到的数据保留在读取器里。
+pub struct FrameReader<R> {
+    inner: R,
+    buf: BytesMut,
+    frame_max: u32,
+}
+
+const READ_CHUNK: usize = 16 * 1024;
+
+impl<R: AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(inner: R, frame_max: u32) -> FrameReader<R> {
+        FrameReader {
+            inner,
+            buf: BytesMut::new(),
+            frame_max,
+        }
+    }
+
+    pub fn set_frame_max(&mut self, frame_max: u32) {
+        self.frame_max = frame_max;
+    }
+
+    /// 读取下一个帧。连接在两个帧之间被正常关闭时返回 `Ok(None)`。
+    pub async fn read_frame(&mut self) -> Result<Option<Frame>, ReadError> {
+        loop {
+            if let Some(frame) =
+                Frame::decode(&mut self.buf, self.frame_max).map_err(ReadError::Frame)?
+            {
+                if self.buf.is_empty() && self.buf.capacity() > READ_CHUNK {
+                    // 不让一个很大的帧使这个连接长期占用大缓冲区。
+                    self.buf = BytesMut::new();
+                }
+                return Ok(Some(frame));
+            }
+            if self.buf.capacity() - self.buf.len() < 4096 {
+                self.buf.reserve(READ_CHUNK);
+            }
+            let n = self
+                .inner
+                .read_buf(&mut self.buf)
+                .await
+                .map_err(ReadError::Io)?;
+            if n == 0 {
+                return if self.buf.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(ReadError::UnexpectedEof)
+                };
+            }
+        }
+    }
+}
+
+pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> io::Result<()> {
+    let mut out = BytesMut::with_capacity(frame.payload.len() + 8);
+    frame.encode(&mut out);
+    w.write_all(&out).await
+}

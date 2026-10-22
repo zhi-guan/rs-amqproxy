@@ -1,5 +1,6 @@
 use amqproxy::config::Config;
-use tracing::{debug, info};
+use amqproxy::server::Server;
+use tracing::{debug, error, info};
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -31,5 +32,12 @@ async fn main() {
         "Proxy configured"
     );
     debug!("Debug logging enabled");
-    // 监听和转发由后续 issue 实现。
+    let server = match Server::bind(config).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Cannot listen: {e}");
+            std::process::exit(1);
+        }
+    };
+    server.run().await;
 }
