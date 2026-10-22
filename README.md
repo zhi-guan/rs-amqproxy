@@ -86,6 +86,16 @@ cargo test --features integration --test integration
 
 测试在 TCP 边界上进行：用脚本化的假 Broker 和测试客户端驱动代理（见 [设计说明](docs/design.md) 第 12 节）。
 
+内存验收压测（PHP 7.3 + php-amqplib 3.1.0，需要 Docker）：
+
+```bash
+test/soak/build.sh                     # 构建 musl + jemalloc 二进制
+test/soak/soak.py --mode smoke         # 约 15 分钟
+test/soak/soak.py --mode accelerated   # 约 2 小时，发版前运行
+```
+
+报告和原始数据保存在 `target/soak/<时间>/`。
+
 ## 许可证
 
 MIT。原项目 © CloudAMQP。
