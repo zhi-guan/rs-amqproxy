@@ -10,6 +10,9 @@ use tracing::debug;
 use crate::client_handshake::Credentials;
 use crate::upstream::{self, ConnCounter, Target, UpstreamConn, UpstreamError};
 
+/// 检查一个空闲连接最多花多长时间。
+const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
+
 struct Idle {
     conn: UpstreamConn,
     since: Instant,
@@ -79,22 +82,27 @@ impl Pool {
                 .flat_map(|(k, q)| q.into_iter().map(move |i| (k.clone(), i)))
                 .collect()
         };
-        let mut keep = Vec::with_capacity(taken.len());
         for (creds, mut item) in taken {
-            if !(item.conn.poll_idle().await && item.conn.heartbeat_tick().await) {
-                debug!("Dropping a dead pooled upstream connection");
-            } else if item.since.elapsed() >= self.idle_timeout {
+            if item.since.elapsed() >= self.idle_timeout {
                 tokio::spawn(
                     item.conn
                         .close("Pooled connection closed due to inactivity"),
                 );
-            } else {
-                keep.push((creds, item));
+                continue;
             }
-        }
-        let mut idle = self.idle.lock().unwrap();
-        for (creds, item) in keep {
-            idle.entry(creds).or_default().push_back(item);
+            // 卡住的 socket 不能卡住整个清理任务。
+            let healthy = tokio::time::timeout(HEALTH_CHECK_TIMEOUT, async {
+                item.conn.poll_idle().await && item.conn.heartbeat_tick().await
+            })
+            .await
+            .unwrap_or(false);
+            if healthy {
+                // 检查完一个就放回一个，借出方等待的时间最短。
+                let mut idle = self.idle.lock().unwrap();
+                idle.entry(creds).or_default().push_back(item);
+            } else {
+                debug!("Dropping a dead pooled upstream connection");
+            }
         }
     }
 

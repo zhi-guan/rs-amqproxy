@@ -121,7 +121,12 @@ impl Server {
             task.abort();
         }
         let _ = self.shared.shutdown.send(true);
-        self.shared.pool.close_all().await;
+        if tokio::time::timeout(SHUTDOWN_GRACE, self.shared.pool.close_all())
+            .await
+            .is_err()
+        {
+            error!("Timed out closing pooled upstream connections");
+        }
         let drained = async {
             while self.shared.clients.load(Ordering::Relaxed) > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;

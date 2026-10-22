@@ -170,3 +170,23 @@ async fn a_client_that_stops_reading_does_not_kill_the_upstream_connection() {
         .unwrap();
     open_channel(&mut c2, &mut conn, 1).await;
 }
+
+#[tokio::test]
+async fn messages_interleaved_on_two_channels_are_tracked_per_channel() {
+    let broker = FakeBroker::start().await;
+    let (_proxy, mut c1, mut conn) = connected(&broker).await;
+    open_channel(&mut c1, &mut conn, 1).await;
+    open_channel(&mut c1, &mut conn, 2).await;
+
+    // 第 1 个 channel 上的消息只发了一半；第 2 个 channel 上的消息是完整的。
+    c1.send(publish(1)).await;
+    c1.send(header(1, 100)).await;
+    c1.send(publish(2)).await;
+    c1.send(header(2, 0)).await;
+    for _ in 0..4 {
+        conn.recv().await;
+    }
+    c1.drop_abruptly();
+
+    conn.expect_closed().await; // channel 1 的消息没发完：上游连接必须丢弃
+}

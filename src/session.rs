@@ -4,7 +4,8 @@
 //! 整个会话在一个任务里用 `select!` 完成：写一侧时不读另一侧，所以缓冲区
 //! 不会无限增长（背压），也不需要锁。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io;
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -20,6 +21,9 @@ use crate::upstream::UpstreamConn;
 
 /// 等待 Broker 确认关闭 channel 的最长时间。超时就丢弃这个上游连接。
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+/// 写入客户端的最长时间。客户端活着但不读取数据时，会话不能永远卡在写入上
+/// （期间上游心跳也会停止）。与 php-amqplib 常用的 read_write_timeout 一致。
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 运行会话，直到任一侧结束。如果上游连接仍然干净、可以复用，就返回它；
 /// 否则关闭它并返回 `None`。
@@ -39,7 +43,6 @@ pub async fn run(
 /// 客户端在消息中途离开时，上游连接的状态无法确定，必须丢弃。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Content {
-    Idle,
     ExpectHeader,
     Body { remaining: u64 },
 }
@@ -50,13 +53,13 @@ async fn forward(
     up: &mut UpstreamConn,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
-    let mut content = Content::Idle;
+    let mut content: HashMap<u16, Content> = HashMap::new();
     let mut ticker = up.heartbeat_tick_interval().map(tokio::time::interval);
     let reusable = loop {
         tokio::select! {
-            _ = shutdown.changed() => {
+            _ = shutdown_requested(shutdown) => {
                 let close = methods::build_connection_close(methods::CONNECTION_FORCED, "AMQProxy shutdown");
-                let _ = write_frame(&mut client.writer, &close).await;
+                let _ = write_client(client, &close).await;
                 break false;
             },
             _ = tick(&mut ticker) => {
@@ -90,22 +93,19 @@ async fn forward(
             },
         }
     };
-    reusable && content == Content::Idle
+    reusable && content.is_empty()
 }
 
 /// `None` 表示继续；`Some(reusable)` 表示会话结束。
 async fn from_client(
     client: &mut ClientConn,
     up: &mut UpstreamConn,
-    content: &mut Content,
+    content: &mut HashMap<u16, Content>,
     frame: Frame,
 ) -> Option<bool> {
     match frame.kind {
         FrameType::Heartbeat => {
-            return write_frame(&mut client.writer, &frame)
-                .await
-                .is_err()
-                .then_some(true);
+            return write_client(client, &frame).await.is_err().then_some(true);
         }
         FrameType::Header | FrameType::Body => {
             if let Err(msg) = track_content(content, &frame) {
@@ -120,7 +120,7 @@ async fn from_client(
     let ids = methods::method_ids(&frame.payload);
     match ids {
         Some((CONNECTION, CONNECTION_CLOSE)) => {
-            let _ = write_frame(&mut client.writer, &methods::build_connection_close_ok()).await;
+            let _ = write_client(client, &methods::build_connection_close_ok()).await;
             return Some(true);
         }
         // 这个 channel 在上游已经打开：伪造 open-ok，不转发。
@@ -136,7 +136,7 @@ async fn from_client(
         }
         Some((class, method)) => {
             if (class, method) == (methods::BASIC, methods::BASIC_PUBLISH) {
-                *content = Content::ExpectHeader;
+                content.insert(ch, Content::ExpectHeader);
             }
             let no_ack = class == methods::BASIC
                 && method == methods::BASIC_GET
@@ -151,33 +151,28 @@ async fn from_client(
 }
 
 async fn reply_to_client(client: &mut ClientConn, reply: &Frame) -> Option<bool> {
-    write_frame(&mut client.writer, reply)
-        .await
-        .is_err()
-        .then_some(true)
+    write_client(client, reply).await.is_err().then_some(true)
 }
 
-fn track_content(content: &mut Content, frame: &Frame) -> Result<(), &'static str> {
-    match (*content, frame.kind) {
-        (Content::ExpectHeader, FrameType::Header) => {
+/// 按 channel 跟踪消息内容：不同 channel 上的消息可以交错发送。
+fn track_content(content: &mut HashMap<u16, Content>, frame: &Frame) -> Result<(), &'static str> {
+    let channel = frame.channel;
+    let next = match (content.get(&channel).copied(), frame.kind) {
+        (Some(Content::ExpectHeader), FrameType::Header) => {
             let size = frame.payload.get(4..12).ok_or("malformed content header")?;
             let size = u64::from_be_bytes(size.try_into().expect("slice has 8 bytes"));
-            *content = if size == 0 {
-                Content::Idle
-            } else {
-                Content::Body { remaining: size }
-            };
+            (size > 0).then_some(Content::Body { remaining: size })
         }
-        (Content::Body { remaining }, FrameType::Body) => {
+        (Some(Content::Body { remaining }), FrameType::Body) => {
             let remaining = remaining.saturating_sub(frame.payload.len() as u64);
-            *content = if remaining == 0 {
-                Content::Idle
-            } else {
-                Content::Body { remaining }
-            };
+            (remaining > 0).then_some(Content::Body { remaining })
         }
-        _ => {}
-    }
+        (state, _) => state,
+    };
+    match next {
+        Some(state) => content.insert(channel, state),
+        None => content.remove(&channel),
+    };
     Ok(())
 }
 
@@ -230,7 +225,7 @@ async fn from_upstream(
                 // Broker 主动关闭连接：回复 close-ok，并把原因转给客户端。
                 let _ = up.send(&methods::build_connection_close_ok()).await;
                 error!("Upstream closed connection: {}", close_text(&frame));
-                let _ = write_frame(&mut client.writer, &frame).await;
+                let _ = write_client(client, &frame).await;
                 return Some(false);
             }
             Some((CHANNEL, CHANNEL_OPEN_OK)) => {
@@ -246,10 +241,7 @@ async fn from_upstream(
         }
     }
     // 写入客户端失败：客户端已经不在了，上游连接本身没有问题。
-    write_frame(&mut client.writer, &frame)
-        .await
-        .is_err()
-        .then_some(true)
+    write_client(client, &frame).await.is_err().then_some(true)
 }
 
 /// 客户端结束后，把上游连接恢复到干净状态：确认 Broker 发起的关闭，关闭所有
@@ -325,11 +317,23 @@ fn close_text(frame: &Frame) -> String {
 async fn upstream_gone(client: &mut ClientConn, why: &str) {
     error!("Upstream {why}");
     let close = methods::build_connection_close(methods::CONNECTION_FORCED, "UPSTREAM_ERROR");
-    let _ = write_frame(&mut client.writer, &close).await;
+    let _ = write_client(client, &close).await;
 }
 
 async fn frame_error(client: &mut ClientConn, why: &str) {
     let close =
         methods::build_connection_close(methods::FRAME_ERROR, &format!("FRAME_ERROR - {why}"));
-    let _ = write_frame(&mut client.writer, &close).await;
+    let _ = write_client(client, &close).await;
+}
+
+async fn write_client(client: &mut ClientConn, frame: &Frame) -> io::Result<()> {
+    match tokio::time::timeout(CLIENT_WRITE_TIMEOUT, write_frame(&mut client.writer, frame)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::ErrorKind::TimedOut.into()),
+    }
+}
+
+/// 关闭信号已经发出（即使是在订阅之前）时立即完成。
+async fn shutdown_requested(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stopping| *stopping).await;
 }
