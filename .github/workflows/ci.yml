@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools make
+      - run: cargo build --release --target x86_64-unknown-linux-musl --features jemalloc
+      - name: 确认是静态链接
+        run: |
+          file target/x86_64-unknown-linux-musl/release/amqproxy
+          ! ldd target/x86_64-unknown-linux-musl/release/amqproxy 2>&1 | grep -qv "not a dynamic executable\|statically linked"
+      - name: 在 CentOS 7 容器中运行
+        run: |
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-musl/release/amqproxy:/amqproxy:ro" centos:7 /amqproxy --version

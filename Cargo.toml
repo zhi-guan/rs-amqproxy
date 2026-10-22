@@ -2,6 +2,9 @@
 name = "amqproxy"
 version = "0.1.0"
 edition = "2024"
+description = "AMQP 0-9-1 connection-pooling proxy, a Rust port of cloudamqp/amqproxy v0.4.4"
+license = "MIT"
+repository = "https://github.com/zhi-guan/rs-amqproxy"
 
 [dependencies]
 bytes = "1.12.1"
@@ -19,3 +22,8 @@ webpki-roots = "1.0.10"
 [features]
 # jemalloc 需要本机有 make（musl 构建还需要 musl-tools）。见 ADR-0004。
 jemalloc = ["dep:tikv-jemallocator"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,22 @@
+[Unit]
+Description=AMQProxy: AMQP 连接池代理（Rust 版）
+Documentation=https://github.com/zhi-guan/rs-amqproxy
+After=network.target
+
+[Service]
+Type=simple
+# 上游地址等参数写在 /etc/default/amqproxy，例如：
+#   AMQP_URL=amqp://127.0.0.1:5672
+#   LISTEN_ADDRESS=127.0.0.1
+#   LISTEN_PORT=5673
+EnvironmentFile=-/etc/default/amqproxy
+ExecStart=/usr/bin/amqproxy
+Restart=on-failure
+RestartSec=1
+User=nobody
+LimitNOFILE=65536
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

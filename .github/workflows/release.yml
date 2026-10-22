@@ -1,0 +1,25 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools make
+      - run: cargo build --release --target x86_64-unknown-linux-musl --features jemalloc
+      - name: 打包
+        run: scripts/package.sh "${GITHUB_REF_NAME}"
+      - name: 发布
+        run: gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
