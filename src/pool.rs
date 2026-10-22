@@ -81,7 +81,7 @@ impl Pool {
         };
         let mut keep = Vec::with_capacity(taken.len());
         for (creds, mut item) in taken {
-            if !item.conn.poll_idle().await {
+            if !(item.conn.poll_idle().await && item.conn.heartbeat_tick().await) {
                 debug!("Dropping a dead pooled upstream connection");
             } else if item.since.elapsed() >= self.idle_timeout {
                 tokio::spawn(

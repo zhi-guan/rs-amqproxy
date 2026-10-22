@@ -47,12 +47,16 @@ pub struct FakeBroker {
     pub addr: SocketAddr,
     /// 握手时向代理建议的 frame_max。
     pub frame_max: u32,
+    /// 握手时向代理建议的心跳间隔（秒）。
+    pub heartbeat: u16,
 }
 
 pub struct BrokerConn {
     pub user: String,
     pub password: String,
     pub vhost: String,
+    /// 代理在 `tune-ok` 里回复的心跳间隔（秒）。
+    pub heartbeat: u16,
     reader: FrameReader<ReadHalf<TcpStream>>,
     writer: WriteHalf<TcpStream>,
 }
@@ -65,6 +69,7 @@ impl FakeBroker {
             listener,
             addr,
             frame_max: 131_072,
+            heartbeat: 0,
         }
     }
 
@@ -106,7 +111,7 @@ impl FakeBroker {
             &methods::build_tune(Tune {
                 channel_max: 2047,
                 frame_max: self.frame_max,
-                heartbeat: 0,
+                heartbeat: self.heartbeat,
             }),
         )
         .await;
@@ -114,7 +119,7 @@ impl FakeBroker {
             .await
             .unwrap()
             .unwrap();
-        methods::parse_tune_ok(&tune_ok.payload).unwrap();
+        let tune_ok = methods::parse_tune_ok(&tune_ok.payload).unwrap();
         let open = within("open", reader.read_frame()).await.unwrap().unwrap();
         let open = methods::parse_open(&open.payload).unwrap();
         if let Some((code, text)) = reject {
@@ -134,6 +139,7 @@ impl FakeBroker {
             user,
             password,
             vhost: open.vhost,
+            heartbeat: tune_ok.heartbeat,
             reader,
             writer,
         })
@@ -294,6 +300,13 @@ impl TestClient {
         within("frame or EOF", self.reader.read_frame())
             .await
             .unwrap_or(None)
+    }
+
+    /// 在 `d` 时间内没有收到任何帧，也没有被关闭。
+    pub async fn expect_quiet_for(&mut self, d: Duration) {
+        if let Ok(f) = tokio::time::timeout(d, self.recv_or_eof()).await {
+            panic!("expected silence, got {f:?}");
+        }
     }
 
     /// 直接断开 TCP 连接（不发 `connection.close`）。

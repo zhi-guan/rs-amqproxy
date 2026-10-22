@@ -42,8 +42,15 @@ enum Content {
 /// 返回 `true` 表示会话因为客户端结束，上游连接没有问题。
 async fn forward(client: &mut ClientConn, up: &mut UpstreamConn) -> bool {
     let mut content = Content::Idle;
+    let mut ticker = up.heartbeat_tick_interval().map(tokio::time::interval);
     let reusable = loop {
         tokio::select! {
+            _ = tick(&mut ticker) => {
+                if !up.heartbeat_tick().await {
+                    upstream_gone(client, "heartbeat timeout").await;
+                    break false;
+                }
+            },
             frame = client.reader.read_frame() => match frame {
                 Ok(Some(frame)) => {
                     if let Some(end) = from_client(client, up, &mut content, frame).await {
@@ -58,7 +65,7 @@ async fn forward(client: &mut ClientConn, up: &mut UpstreamConn) -> bool {
                 }
                 Err(e) => { debug!("Client read error: {e}"); break true; }
             },
-            frame = up.reader.read_frame() => match frame {
+            frame = up.recv() => match frame {
                 Ok(Some(frame)) => {
                     if let Some(end) = from_upstream(client, up, frame).await {
                         break end;
@@ -175,12 +182,22 @@ async fn forward_to_upstream(
         frame_error(client, &msg).await;
         return Some(false);
     }
-    match write_frame(&mut up.writer, frame).await {
+    match up.send(frame).await {
         Ok(()) => None,
         Err(e) => {
             upstream_gone(client, &format!("write error: {e}")).await;
             Some(false)
         }
+    }
+}
+
+/// 等待下一次心跳检查；没有心跳时永远等待。
+async fn tick(ticker: &mut Option<tokio::time::Interval>) {
+    match ticker {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -190,11 +207,14 @@ async fn from_upstream(
     up: &mut UpstreamConn,
     frame: Frame,
 ) -> Option<bool> {
+    if frame.kind == FrameType::Heartbeat {
+        return None; // 客户端协商的是 heartbeat=0，不转发
+    }
     if frame.kind == FrameType::Method {
         match methods::method_ids(&frame.payload) {
             Some((CONNECTION, CONNECTION_CLOSE)) => {
                 // Broker 主动关闭连接：回复 close-ok，并把原因转给客户端。
-                let _ = write_frame(&mut up.writer, &methods::build_connection_close_ok()).await;
+                let _ = up.send(&methods::build_connection_close_ok()).await;
                 error!("Upstream closed connection: {}", close_text(&frame));
                 let _ = write_frame(&mut client.writer, &frame).await;
                 return Some(false);
@@ -222,10 +242,7 @@ async fn from_upstream(
 /// 不安全 Channel 并等待 Broker 确认。返回 `false` 表示连接不能再用。
 async fn release_channels(up: &mut UpstreamConn) -> bool {
     for ch in std::mem::take(&mut up.pending_broker_close) {
-        if write_frame(&mut up.writer, &methods::build_channel_close_ok(ch))
-            .await
-            .is_err()
-        {
+        if up.send(&methods::build_channel_close_ok(ch)).await.is_err() {
             return false;
         }
     }
@@ -237,13 +254,13 @@ async fn release_channels(up: &mut UpstreamConn) -> bool {
     up.unsafe_channels.clear();
     for &ch in &waiting {
         let close = methods::build_channel_close(ch, methods::REPLY_SUCCESS, "Client disconnected");
-        if write_frame(&mut up.writer, &close).await.is_err() {
+        if up.send(&close).await.is_err() {
             return false;
         }
     }
     let drained = tokio::time::timeout(CLEANUP_TIMEOUT, async {
         while !waiting.is_empty() {
-            let frame = match up.reader.read_frame().await {
+            let frame = match up.recv().await {
                 Ok(Some(f)) => f,
                 _ => return false,
             };
@@ -260,13 +277,12 @@ async fn release_channels(up: &mut UpstreamConn) -> bool {
                     waiting.remove(&frame.channel);
                     up.forget_channel(frame.channel);
                     let ok = methods::build_channel_close_ok(frame.channel);
-                    if write_frame(&mut up.writer, &ok).await.is_err() {
+                    if up.send(&ok).await.is_err() {
                         return false;
                     }
                 }
                 Some((CONNECTION, CONNECTION_CLOSE)) => {
-                    let _ =
-                        write_frame(&mut up.writer, &methods::build_connection_close_ok()).await;
+                    let _ = up.send(&methods::build_connection_close_ok()).await;
                     return false;
                 }
                 _ => {} // 投递、basic.cancel 等：丢弃

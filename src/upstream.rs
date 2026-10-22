@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
@@ -19,6 +19,7 @@ use crate::io::{BoxIo, configure_tcp};
 use crate::methods::{self, Close, Tune};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_HEARTBEAT_SECS: u16 = 60;
 
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -77,6 +78,10 @@ pub struct UpstreamConn {
     pub unsafe_channels: HashSet<u16>,
     /// Broker 发来 `channel.close`、客户端还没有回复 `close-ok` 的 channel。
     pub pending_broker_close: HashSet<u16>,
+    /// 与 Broker 协商的心跳间隔，零表示不使用心跳。
+    pub heartbeat: Duration,
+    last_recv: Instant,
+    last_sent: Instant,
     pub(crate) counter: Option<ConnCounter>,
 }
 
@@ -101,7 +106,7 @@ impl UpstreamConn {
     /// 返回 `false` 表示连接已断开或状态不可信，不能再使用。
     pub async fn poll_idle(&mut self) -> bool {
         loop {
-            let frame = match self.reader.read_frame().now_or_never() {
+            let frame = match self.recv().now_or_never() {
                 None => return true,
                 Some(Ok(Some(frame))) => frame,
                 Some(Ok(None)) | Some(Err(_)) => return false,
@@ -113,7 +118,7 @@ impl UpstreamConn {
                 Some((methods::CHANNEL, methods::CHANNEL_CLOSE)) => {
                     self.forget_channel(frame.channel);
                     let ok = methods::build_channel_close_ok(frame.channel);
-                    if write_frame(&mut self.writer, &ok).await.is_err() {
+                    if self.send(&ok).await.is_err() {
                         return false;
                     }
                 }
@@ -121,8 +126,7 @@ impl UpstreamConn {
                     self.forget_channel(frame.channel);
                 }
                 Some((methods::CONNECTION, methods::CONNECTION_CLOSE)) => {
-                    let _ =
-                        write_frame(&mut self.writer, &methods::build_connection_close_ok()).await;
+                    let _ = self.send(&methods::build_connection_close_ok()).await;
                     return false;
                 }
                 other => {
@@ -131,6 +135,41 @@ impl UpstreamConn {
                 }
             }
         }
+    }
+
+    /// 读取下一个帧，并记录收到数据的时间（用于判断 Broker 是否还活着）。
+    pub async fn recv(&mut self) -> Result<Option<Frame>, ReadError> {
+        let frame = self.reader.read_frame().await?;
+        if frame.is_some() {
+            self.last_recv = Instant::now();
+        }
+        Ok(frame)
+    }
+
+    pub async fn send(&mut self, frame: &Frame) -> io::Result<()> {
+        write_frame(&mut self.writer, frame).await?;
+        self.last_sent = Instant::now();
+        Ok(())
+    }
+
+    /// 心跳定时器的间隔：协商间隔的一半。没有心跳时返回 `None`。
+    pub fn heartbeat_tick_interval(&self) -> Option<Duration> {
+        (!self.heartbeat.is_zero()).then(|| self.heartbeat / 2)
+    }
+
+    /// 需要时发送心跳。返回 `false` 表示 Broker 超过两个心跳间隔没有任何数据，
+    /// 连接已经死亡。
+    pub async fn heartbeat_tick(&mut self) -> bool {
+        if self.heartbeat.is_zero() {
+            return true;
+        }
+        if self.last_recv.elapsed() > self.heartbeat * 2 {
+            return false;
+        }
+        if self.last_sent.elapsed() >= self.heartbeat / 2 {
+            return self.send(&Frame::heartbeat()).await.is_ok();
+        }
+        true
     }
 
     /// Broker 上的这个 channel 已经关闭。
@@ -142,7 +181,7 @@ impl UpstreamConn {
     /// 礼貌地关闭上游连接。
     pub async fn close(mut self, reason: &str) {
         let close = methods::build_connection_close(methods::REPLY_SUCCESS, reason);
-        let _ = write_frame(&mut self.writer, &close).await;
+        let _ = self.send(&close).await;
         let _ = self.writer.shutdown().await;
     }
 }
@@ -212,10 +251,16 @@ async fn handshake(stream: BoxIo, creds: &Credentials) -> Result<UpstreamConn, U
         0 => CLIENT_FRAME_MAX,
         n => n.min(CLIENT_FRAME_MAX),
     };
+    // Broker 建议 0 时也使用心跳，这样才能发现死连接，也不会被
+    // 空闲超时关闭（ADR-0005）。
+    let heartbeat = match tune.heartbeat {
+        0 => DEFAULT_HEARTBEAT_SECS,
+        n => n,
+    };
     let tune_ok = Tune {
         channel_max: tune.channel_max,
         frame_max,
-        heartbeat: 0,
+        heartbeat,
     };
     write_frame(&mut writer, &methods::build_tune_ok(tune_ok)).await?;
     write_frame(&mut writer, &methods::build_open(&creds.vhost)).await?;
@@ -237,6 +282,9 @@ async fn handshake(stream: BoxIo, creds: &Credentials) -> Result<UpstreamConn, U
         open_channels: HashSet::new(),
         unsafe_channels: HashSet::new(),
         pending_broker_close: HashSet::new(),
+        heartbeat: Duration::from_secs(u64::from(heartbeat)),
+        last_recv: Instant::now(),
+        last_sent: Instant::now(),
         counter: None,
     })
 }
