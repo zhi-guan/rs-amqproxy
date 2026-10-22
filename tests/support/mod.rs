@@ -419,3 +419,20 @@ pub async fn start_stoppable_proxy(
     }));
     (addr, tx, handle)
 }
+
+/// 连接到真实 Broker（`host:port`）的代理，可选 TLS。
+pub async fn start_proxy_to(host: &str, port: u16, tls: bool) -> SocketAddr {
+    let config = Config {
+        listen_address: "127.0.0.1".into(),
+        listen_port: 0,
+        debug: false,
+        idle_connection_timeout: Duration::from_secs(5),
+        upstream_host: host.into(),
+        upstream_port: port,
+        upstream_tls: tls,
+    };
+    let server = Server::bind(config).await.unwrap();
+    let addr = server.local_addr();
+    tokio::spawn(server.run());
+    addr
+}

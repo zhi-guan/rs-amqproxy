@@ -1,0 +1,19 @@
+# 本地测试用的 RabbitMQ（明文 5672，TLS 5671）。不会被交付。
+# 启动：  docker compose -f test/docker-compose.yml up -d
+# 停止：  docker compose -f test/docker-compose.yml down
+# 重置：  docker compose -f test/docker-compose.yml down -v
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:5671:5671"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/10-test.conf:ro
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 30

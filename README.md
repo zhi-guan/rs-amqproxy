@@ -37,7 +37,7 @@ amqproxy [options] [amqp upstream url]
 | `-v, --version` | — | | 版本 |
 | 位置参数 | `AMQP_URL` | 必填 | 上游地址，例如 `amqp://host` 或 `amqps://host:5671` |
 
-优先级：命令行 > 环境变量 > 默认值。上游 URL 里只有 scheme、host 和端口有效；用户名、密码和 vhost 由客户端提供。`amqps://` 使用 TLS（rustls）。
+优先级：命令行 > 环境变量 > 默认值。上游 URL 里只有 scheme、host 和端口有效；用户名、密码和 vhost 由客户端提供。`amqps://` 使用 TLS（rustls），内置常见的公共 CA。如果 Broker 使用私有 CA，把 CA 证书（PEM）的路径放进环境变量 `SSL_CERT_FILE`，它会被额外信任。
 
 客户端只需把连接地址改成代理，例如 `127.0.0.1:5673`。
 
@@ -74,6 +74,14 @@ cargo build --release --target x86_64-unknown-linux-musl --features jemalloc
 
 ```bash
 cargo test
+```
+
+集成测试使用真实的 RabbitMQ（含 TLS），需要 Docker：
+
+```bash
+test/gen-certs.sh
+docker compose -f test/docker-compose.yml up -d --wait
+cargo test --features integration --test integration
 ```
 
 测试在 TCP 边界上进行：用脚本化的假 Broker 和测试客户端驱动代理（见 [设计说明](docs/design.md) 第 12 节）。

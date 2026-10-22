@@ -10,7 +10,8 @@ use futures_util::FutureExt;
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::rustls::pki_types::pem::PemObject;
+use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 
 use crate::client_handshake::{CLIENT_FRAME_MAX, Credentials};
@@ -193,6 +194,21 @@ fn tls_config() -> Arc<ClientConfig> {
         .get_or_init(|| {
             let mut roots = RootCertStore::empty();
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            // 私有 CA：SSL_CERT_FILE 指向一个 PEM 文件，其中的证书会被额外信任。
+            if let Some(path) = std::env::var_os("SSL_CERT_FILE") {
+                match CertificateDer::pem_file_iter(&path) {
+                    Ok(certs) => {
+                        for cert in certs.flatten() {
+                            if let Err(e) = roots.add(cert) {
+                                tracing::warn!(
+                                    "Ignoring an invalid certificate in SSL_CERT_FILE: {e}"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("Cannot read SSL_CERT_FILE: {e}"),
+                }
+            }
             Arc::new(
                 ClientConfig::builder()
                     .with_root_certificates(roots)
