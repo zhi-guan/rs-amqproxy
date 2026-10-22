@@ -39,5 +39,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    server.run().await;
+    server.run_until(shutdown_signal()).await;
+}
+
+/// SIGINT 或 SIGTERM。
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+    info!("Received a termination signal");
 }

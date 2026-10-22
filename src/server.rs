@@ -1,5 +1,6 @@
 //! 监听、接受连接，并为每个客户端连接启动一个会话。
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tracing::{debug, error, info};
 
 use crate::client_handshake::{self, ClientConn, Credentials, HandshakeError};
@@ -24,7 +26,12 @@ const STATS_INTERVAL: Duration = Duration::from_secs(5);
 struct Shared {
     pool: Pool,
     clients: Arc<AtomicUsize>,
+    /// 关闭时发出 `true`，所有会话据此通知客户端并结束。
+    shutdown: watch::Sender<bool>,
 }
+
+/// 等待会话结束的最长时间。
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 pub struct Server {
     listener: TcpListener,
@@ -60,6 +67,7 @@ impl Server {
         let shared = Shared {
             pool: Pool::new(target, config.idle_connection_timeout),
             clients: Arc::new(AtomicUsize::new(0)),
+            shutdown: watch::channel(false).0,
         };
         Ok(Server {
             listener,
@@ -73,26 +81,54 @@ impl Server {
             .expect("listener has a local address")
     }
 
+    /// 一直运行。
     pub async fn run(self) {
-        tokio::spawn(reap_loop(self.shared.clone()));
-        tokio::spawn(stats_loop(self.shared.clone()));
+        self.run_until(std::future::pending()).await;
+    }
+
+    /// 运行到 `shutdown` 完成，然后优雅关闭：停止接受连接，通知所有客户端，
+    /// 关闭所有上游连接。
+    pub async fn run_until(self, shutdown: impl Future<Output = ()>) {
+        let background = [
+            tokio::spawn(reap_loop(self.shared.clone())),
+            tokio::spawn(stats_loop(self.shared.clone())),
+        ];
+        tokio::pin!(shutdown);
         loop {
-            match self.listener.accept().await {
-                Ok((stream, peer)) => {
-                    let shared = self.shared.clone();
-                    tokio::spawn(async move {
-                        let _guard = ClientGuard::new(&shared.clients);
-                        debug!("Client connected: {peer}");
-                        handle_connection(stream, &shared).await;
-                        debug!("Client disconnected: {peer}");
-                    });
-                }
-                Err(e) => {
-                    // 例如文件描述符用完。稍等一下再试，不要空转。
-                    error!("Accept failed: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+            tokio::select! {
+                _ = &mut shutdown => break,
+                accepted = self.listener.accept() => match accepted {
+                    Ok((stream, peer)) => {
+                        let shared = self.shared.clone();
+                        tokio::spawn(async move {
+                            let _guard = ClientGuard::new(&shared.clients);
+                            debug!("Client connected: {peer}");
+                            handle_connection(stream, &shared).await;
+                            debug!("Client disconnected: {peer}");
+                        });
+                    }
+                    Err(e) => {
+                        // 例如文件描述符用完。稍等一下再试，不要空转。
+                        error!("Accept failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                },
             }
+        }
+        info!("Proxy stopping accepting connections");
+        drop(self.listener);
+        for task in &background {
+            task.abort();
+        }
+        let _ = self.shared.shutdown.send(true);
+        self.shared.pool.close_all().await;
+        let drained = async {
+            while self.shared.clients.load(Ordering::Relaxed) > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_GRACE, drained).await.is_err() {
+            error!("Some clients did not disconnect in time");
         }
     }
 }
@@ -149,7 +185,7 @@ async fn handle_connection(stream: TcpStream, shared: &Shared) {
                 shared.pool.give_back(&creds, up);
                 return;
             }
-            if let Some(up) = session::run(&mut client, up).await {
+            if let Some(up) = session::run(&mut client, up, shared.shutdown.subscribe()).await {
                 shared.pool.give_back(&creds, up);
             }
             let _ = client.writer.shutdown().await;

@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
 use crate::client_handshake::ClientConn;
@@ -22,8 +23,12 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 运行会话，直到任一侧结束。如果上游连接仍然干净、可以复用，就返回它；
 /// 否则关闭它并返回 `None`。
-pub async fn run(client: &mut ClientConn, mut up: UpstreamConn) -> Option<UpstreamConn> {
-    if forward(client, &mut up).await && release_channels(&mut up).await {
+pub async fn run(
+    client: &mut ClientConn,
+    mut up: UpstreamConn,
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<UpstreamConn> {
+    if forward(client, &mut up, &mut shutdown).await && release_channels(&mut up).await {
         return Some(up);
     }
     up.close("").await;
@@ -40,11 +45,20 @@ enum Content {
 }
 
 /// 返回 `true` 表示会话因为客户端结束，上游连接没有问题。
-async fn forward(client: &mut ClientConn, up: &mut UpstreamConn) -> bool {
+async fn forward(
+    client: &mut ClientConn,
+    up: &mut UpstreamConn,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
     let mut content = Content::Idle;
     let mut ticker = up.heartbeat_tick_interval().map(tokio::time::interval);
     let reusable = loop {
         tokio::select! {
+            _ = shutdown.changed() => {
+                let close = methods::build_connection_close(methods::CONNECTION_FORCED, "AMQProxy shutdown");
+                let _ = write_frame(&mut client.writer, &close).await;
+                break false;
+            },
             _ = tick(&mut ticker) => {
                 if !up.heartbeat_tick().await {
                     upstream_gone(client, "heartbeat timeout").await;

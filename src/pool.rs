@@ -98,6 +98,14 @@ impl Pool {
         }
     }
 
+    /// 关闭池中所有的空闲连接（关闭代理时调用）。
+    pub async fn close_all(&self) {
+        let all = std::mem::take(&mut *self.idle.lock().unwrap());
+        for item in all.into_values().flatten() {
+            item.conn.close("AMQProxy shutdown").await;
+        }
+    }
+
     /// 清理的间隔：不超过空闲超时的四分之一，最长 1 秒。
     pub fn reap_interval(&self) -> Duration {
         (self.idle_timeout / 4).clamp(Duration::from_millis(50), Duration::from_secs(1))

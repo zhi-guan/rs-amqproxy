@@ -393,3 +393,29 @@ pub fn content_header(channel: u16, body_size: u64) -> Frame {
     b.put_u16(0);
     Frame::new(FrameType::Header, channel, b.freeze())
 }
+
+/// 可以被关闭的代理：返回地址、关闭触发器和运行任务。
+pub async fn start_stoppable_proxy(
+    upstream: SocketAddr,
+) -> (
+    SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let config = Config {
+        listen_address: "127.0.0.1".into(),
+        listen_port: 0,
+        debug: false,
+        idle_connection_timeout: Duration::from_secs(60),
+        upstream_host: upstream.ip().to_string(),
+        upstream_port: upstream.port(),
+        upstream_tls: false,
+    };
+    let server = Server::bind(config).await.unwrap();
+    let addr = server.local_addr();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(server.run_until(async {
+        let _ = rx.await;
+    }));
+    (addr, tx, handle)
+}
