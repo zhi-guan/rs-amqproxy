@@ -10,7 +10,7 @@ use std::time::Duration;
 use tracing::{debug, error, warn};
 
 use crate::client_handshake::ClientConn;
-use crate::frame::{Frame, FrameType, write_frame};
+use crate::frame::{FRAME_OVERHEAD, Frame, FrameType, ReadError, write_frame};
 use crate::methods::{
     self, CHANNEL, CHANNEL_CLOSE, CHANNEL_CLOSE_OK, CHANNEL_OPEN, CHANNEL_OPEN_OK,
 };
@@ -30,34 +30,55 @@ pub async fn run(client: &mut ClientConn, mut up: UpstreamConn) -> Option<Upstre
     None
 }
 
+/// 客户端正在发送的消息内容（`basic.publish` 之后跟着 header 帧和 body 帧）。
+/// 客户端在消息中途离开时，上游连接的状态无法确定，必须丢弃。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Content {
+    Idle,
+    ExpectHeader,
+    Body { remaining: u64 },
+}
+
 /// 返回 `true` 表示会话因为客户端结束，上游连接没有问题。
 async fn forward(client: &mut ClientConn, up: &mut UpstreamConn) -> bool {
-    loop {
+    let mut content = Content::Idle;
+    let reusable = loop {
         tokio::select! {
             frame = client.reader.read_frame() => match frame {
                 Ok(Some(frame)) => {
-                    if let Some(end) = from_client(client, up, frame).await {
-                        return end;
+                    if let Some(end) = from_client(client, up, &mut content, frame).await {
+                        break end;
                     }
                 }
-                Ok(None) => { debug!("Client disconnected"); return true; }
-                Err(e) => { debug!("Client read error: {e}"); return true; }
+                Ok(None) => { debug!("Client disconnected"); break true; }
+                Err(ReadError::Frame(e)) => {
+                    error!("Invalid frame from client: {e}");
+                    frame_error(client, &e.to_string()).await;
+                    break false;
+                }
+                Err(e) => { debug!("Client read error: {e}"); break true; }
             },
             frame = up.reader.read_frame() => match frame {
                 Ok(Some(frame)) => {
-                    if !from_upstream(client, up, frame).await {
-                        return false;
+                    if let Some(end) = from_upstream(client, up, frame).await {
+                        break end;
                     }
                 }
-                Ok(None) => { upstream_gone(client, "closed the connection").await; return false; }
-                Err(e) => { upstream_gone(client, &e.to_string()).await; return false; }
+                Ok(None) => { upstream_gone(client, "closed the connection").await; break false; }
+                Err(e) => { upstream_gone(client, &e.to_string()).await; break false; }
             },
         }
-    }
+    };
+    reusable && content == Content::Idle
 }
 
 /// `None` 表示继续；`Some(reusable)` 表示会话结束。
-async fn from_client(client: &mut ClientConn, up: &mut UpstreamConn, frame: Frame) -> Option<bool> {
+async fn from_client(
+    client: &mut ClientConn,
+    up: &mut UpstreamConn,
+    content: &mut Content,
+    frame: Frame,
+) -> Option<bool> {
     match frame.kind {
         FrameType::Heartbeat => {
             return write_frame(&mut client.writer, &frame)
@@ -65,8 +86,14 @@ async fn from_client(client: &mut ClientConn, up: &mut UpstreamConn, frame: Fram
                 .is_err()
                 .then_some(true);
         }
+        FrameType::Header | FrameType::Body => {
+            if let Err(msg) = track_content(content, &frame) {
+                frame_error(client, msg).await;
+                return Some(false);
+            }
+            return forward_to_upstream(client, up, &frame).await;
+        }
         FrameType::Method => {}
-        _ => return forward_to_upstream(client, up, &frame).await,
     }
     let ch = frame.channel;
     let ids = methods::method_ids(&frame.payload);
@@ -87,6 +114,9 @@ async fn from_client(client: &mut ClientConn, up: &mut UpstreamConn, frame: Fram
             up.pending_broker_close.remove(&ch);
         }
         Some((class, method)) => {
+            if (class, method) == (methods::BASIC, methods::BASIC_PUBLISH) {
+                *content = Content::ExpectHeader;
+            }
             let no_ack = class == methods::BASIC
                 && method == methods::BASIC_GET
                 && methods::parse_basic_get_no_ack(&frame.payload).unwrap_or(false);
@@ -106,11 +136,45 @@ async fn reply_to_client(client: &mut ClientConn, reply: &Frame) -> Option<bool>
         .then_some(true)
 }
 
+fn track_content(content: &mut Content, frame: &Frame) -> Result<(), &'static str> {
+    match (*content, frame.kind) {
+        (Content::ExpectHeader, FrameType::Header) => {
+            let size = frame.payload.get(4..12).ok_or("malformed content header")?;
+            let size = u64::from_be_bytes(size.try_into().expect("slice has 8 bytes"));
+            *content = if size == 0 {
+                Content::Idle
+            } else {
+                Content::Body { remaining: size }
+            };
+        }
+        (Content::Body { remaining }, FrameType::Body) => {
+            let remaining = remaining.saturating_sub(frame.payload.len() as u64);
+            *content = if remaining == 0 {
+                Content::Idle
+            } else {
+                Content::Body { remaining }
+            };
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 async fn forward_to_upstream(
     client: &mut ClientConn,
     up: &mut UpstreamConn,
     frame: &Frame,
 ) -> Option<bool> {
+    let size = frame.payload.len() as u64 + u64::from(FRAME_OVERHEAD);
+    if size > u64::from(up.frame_max) {
+        let msg = format!(
+            "frame of {size} bytes exceeds the upstream frame_max of {}",
+            up.frame_max
+        );
+        error!("{msg}");
+        frame_error(client, &msg).await;
+        return Some(false);
+    }
     match write_frame(&mut up.writer, frame).await {
         Ok(()) => None,
         Err(e) => {
@@ -120,7 +184,12 @@ async fn forward_to_upstream(
     }
 }
 
-async fn from_upstream(client: &mut ClientConn, up: &mut UpstreamConn, frame: Frame) -> bool {
+/// `None` 表示继续；`Some(reusable)` 表示会话结束。
+async fn from_upstream(
+    client: &mut ClientConn,
+    up: &mut UpstreamConn,
+    frame: Frame,
+) -> Option<bool> {
     if frame.kind == FrameType::Method {
         match methods::method_ids(&frame.payload) {
             Some((CONNECTION, CONNECTION_CLOSE)) => {
@@ -128,7 +197,7 @@ async fn from_upstream(client: &mut ClientConn, up: &mut UpstreamConn, frame: Fr
                 let _ = write_frame(&mut up.writer, &methods::build_connection_close_ok()).await;
                 error!("Upstream closed connection: {}", close_text(&frame));
                 let _ = write_frame(&mut client.writer, &frame).await;
-                return false;
+                return Some(false);
             }
             Some((CHANNEL, CHANNEL_OPEN_OK)) => {
                 up.open_channels.insert(frame.channel);
@@ -142,7 +211,11 @@ async fn from_upstream(client: &mut ClientConn, up: &mut UpstreamConn, frame: Fr
             _ => {}
         }
     }
-    write_frame(&mut client.writer, &frame).await.is_ok()
+    // 写入客户端失败：客户端已经不在了，上游连接本身没有问题。
+    write_frame(&mut client.writer, &frame)
+        .await
+        .is_err()
+        .then_some(true)
 }
 
 /// 客户端结束后，把上游连接恢复到干净状态：确认 Broker 发起的关闭，关闭所有
@@ -222,5 +295,11 @@ fn close_text(frame: &Frame) -> String {
 async fn upstream_gone(client: &mut ClientConn, why: &str) {
     error!("Upstream {why}");
     let close = methods::build_connection_close(methods::CONNECTION_FORCED, "UPSTREAM_ERROR");
+    let _ = write_frame(&mut client.writer, &close).await;
+}
+
+async fn frame_error(client: &mut ClientConn, why: &str) {
+    let close =
+        methods::build_connection_close(methods::FRAME_ERROR, &format!("FRAME_ERROR - {why}"));
     let _ = write_frame(&mut client.writer, &close).await;
 }

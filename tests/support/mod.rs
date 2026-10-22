@@ -45,6 +45,8 @@ pub fn ids(frame: &Frame) -> (u16, u16) {
 pub struct FakeBroker {
     listener: TcpListener,
     pub addr: SocketAddr,
+    /// 握手时向代理建议的 frame_max。
+    pub frame_max: u32,
 }
 
 pub struct BrokerConn {
@@ -59,7 +61,11 @@ impl FakeBroker {
     pub async fn start() -> FakeBroker {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        FakeBroker { listener, addr }
+        FakeBroker {
+            listener,
+            addr,
+            frame_max: 131_072,
+        }
     }
 
     /// 等待代理连接并完成握手（成功）。
@@ -99,7 +105,7 @@ impl FakeBroker {
             &mut writer,
             &methods::build_tune(Tune {
                 channel_max: 2047,
-                frame_max: 131_072,
+                frame_max: self.frame_max,
                 heartbeat: 0,
             }),
         )
@@ -272,6 +278,11 @@ impl TestClient {
         send(&mut self.writer, &frame).await;
     }
 
+    /// 发送原始字节（用来构造格式错误的帧）。
+    pub async fn send_raw(&mut self, bytes: &[u8]) {
+        self.writer.write_all(bytes).await.unwrap();
+    }
+
     pub async fn recv(&mut self) -> Frame {
         within("frame from proxy", self.reader.read_frame())
             .await
@@ -349,4 +360,23 @@ pub fn basic_consume(channel: u16) -> Frame {
 
 pub fn publish(channel: u16) -> Frame {
     method(channel, 60, 40, b"publish")
+}
+
+/// 一个没有 body 的消息的 header 帧。
+pub fn empty_header(channel: u16) -> Frame {
+    let mut b = BytesMut::new();
+    b.put_u16(60);
+    b.put_u16(0);
+    b.put_u64(0);
+    b.put_u16(0);
+    Frame::new(FrameType::Header, channel, b.freeze())
+}
+
+pub fn content_header(channel: u16, body_size: u64) -> Frame {
+    let mut b = BytesMut::new();
+    b.put_u16(60);
+    b.put_u16(0);
+    b.put_u64(body_size);
+    b.put_u16(0);
+    Frame::new(FrameType::Header, channel, b.freeze())
 }

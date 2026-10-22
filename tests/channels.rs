@@ -23,7 +23,9 @@ async fn a_safe_channel_stays_open_upstream_and_is_reused_by_the_next_client() {
     let (proxy, _broker, mut c1, mut conn) = two_clients().await;
     open_channel(&mut c1, &mut conn, 1).await;
     c1.send(publish(1)).await;
+    c1.send(empty_header(1)).await;
     assert_eq!(conn.recv().await, publish(1));
+    assert_eq!(conn.recv().await, empty_header(1));
 
     // 关闭 channel：代理伪造 close-ok，Broker 什么都收不到。
     c1.send(methods::build_channel_close(1, 200, "bye")).await;

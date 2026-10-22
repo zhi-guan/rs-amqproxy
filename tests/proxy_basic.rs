@@ -61,11 +61,7 @@ async fn frames_are_forwarded_unchanged_in_both_directions() {
     let (mut client, mut conn) = (client.unwrap(), conn);
 
     let publish = method(1, 60, 40, b"\x00\x00\x00\x00\x00");
-    let header = Frame::new(
-        FrameType::Header,
-        1,
-        Bytes::from_static(b"\x00\x3c\x00\x00header"),
-    );
+    let header = content_header(1, 100_000);
     let body = Frame::new(FrameType::Body, 1, Bytes::from(vec![7u8; 100_000]));
     for f in [&publish, &header, &body] {
         client.send(f.clone()).await;
