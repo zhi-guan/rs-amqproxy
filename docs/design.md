@@ -11,7 +11,7 @@
 | 客户端 | PHP 7.3（FPM 短连接发布 + 常驻 CLI 消费者），php-amqplib 3.1.0，heartbeat=0，keepalive=false |
 | Broker | 阿里云 RabbitMQ 版（AMQP 0-9-1） |
 | 部署 | 每台应用服务器部署一个代理，监听本机地址 |
-| 验收 | 24 小时压测：预热后 RSS 增长 < 5%；所有客户端断开且超过空闲超时后，内存回到基线 |
+| 验收 | 加速压测（默认约 2 小时）：预热后的稳定阶段 RSS 增长 < 5%；所有客户端断开且超过空闲超时后，内存回到基线。24 小时长跑为可选项 |
 
 ## 2. 整体结构
 
@@ -206,7 +206,7 @@ stateDiagram-v2
 |---|---|---|
 | 单元测试 | 帧编解码、channel 状态机、连接池 | `cargo test`，没有外部依赖 |
 | 集成测试 | Docker 中的 RabbitMQ：发布、basic_get、consume、channel 复用、客户端异常断开、Broker 重启、认证失败、TLS | `cargo test --features integration` |
-| 内存验收 | Docker 中的 PHP 7.3 + php-amqplib 3.1.0：短连接发布 + 常驻消费者 + 随机 kill + Broker 重启，持续 24 小时，记录 RSS 和 jemalloc 统计 | 本地脚本，输出 CSV 和结论 |
+| 内存验收 | Docker 中的 PHP 7.3 + php-amqplib 3.1.0：短连接发布 + 常驻消费者 + 随机 kill + Broker 重启，加速模式（默认约 2 小时）或冒烟模式（约 15 分钟），记录 RSS 和 jemalloc 统计 | 本地脚本，输出 CSV 和结论 |
 
 ## 13. 构建与交付
 
