@@ -327,3 +327,26 @@ pub const GUEST: Creds<'static> = Creds {
     password: "secret",
     vhost: "/",
 };
+
+/// 客户端打开一个 channel，Broker 回复 open-ok。
+pub async fn open_channel(client: &mut TestClient, conn: &mut BrokerConn, channel: u16) {
+    client.send(methods::build_channel_open(channel)).await;
+    let f = conn.recv().await;
+    assert_eq!(ids(&f), (methods::CHANNEL, methods::CHANNEL_OPEN), "{f:?}");
+    assert_eq!(f.channel, channel);
+    conn.send(methods::build_channel_open_ok(channel)).await;
+    let f = client.recv().await;
+    assert_eq!(ids(&f), (methods::CHANNEL, methods::CHANNEL_OPEN_OK));
+}
+
+pub fn basic_get(channel: u16, no_ack: bool) -> Frame {
+    method(channel, 60, 70, &[0, 0, 1, b'q', no_ack as u8])
+}
+
+pub fn basic_consume(channel: u16) -> Frame {
+    method(channel, 60, 20, b"consume")
+}
+
+pub fn publish(channel: u16) -> Frame {
+    method(channel, 60, 40, b"publish")
+}

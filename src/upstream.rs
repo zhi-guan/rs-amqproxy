@@ -73,6 +73,10 @@ pub struct UpstreamConn {
     pub channel_max: u16,
     /// Broker 上当前打开的 channel。
     pub open_channels: HashSet<u16>,
+    /// 其中留下了状态的 channel（不安全 Channel）。
+    pub unsafe_channels: HashSet<u16>,
+    /// Broker 发来 `channel.close`、客户端还没有回复 `close-ok` 的 channel。
+    pub pending_broker_close: HashSet<u16>,
     pub(crate) counter: Option<ConnCounter>,
 }
 
@@ -107,14 +111,14 @@ impl UpstreamConn {
             }
             match methods::method_ids(&frame.payload) {
                 Some((methods::CHANNEL, methods::CHANNEL_CLOSE)) => {
-                    self.open_channels.remove(&frame.channel);
+                    self.forget_channel(frame.channel);
                     let ok = methods::build_channel_close_ok(frame.channel);
                     if write_frame(&mut self.writer, &ok).await.is_err() {
                         return false;
                     }
                 }
                 Some((methods::CHANNEL, methods::CHANNEL_CLOSE_OK)) => {
-                    self.open_channels.remove(&frame.channel);
+                    self.forget_channel(frame.channel);
                 }
                 Some((methods::CONNECTION, methods::CONNECTION_CLOSE)) => {
                     let _ =
@@ -127,6 +131,12 @@ impl UpstreamConn {
                 }
             }
         }
+    }
+
+    /// Broker 上的这个 channel 已经关闭。
+    pub fn forget_channel(&mut self, channel: u16) {
+        self.open_channels.remove(&channel);
+        self.unsafe_channels.remove(&channel);
     }
 
     /// 礼貌地关闭上游连接。
@@ -225,6 +235,8 @@ async fn handshake(stream: BoxIo, creds: &Credentials) -> Result<UpstreamConn, U
         frame_max,
         channel_max: tune.channel_max,
         open_channels: HashSet::new(),
+        unsafe_channels: HashSet::new(),
+        pending_broker_close: HashSet::new(),
         counter: None,
     })
 }
