@@ -1,9 +1,12 @@
 //! 到 Broker 的连接：TCP 或 TLS，握手（设计文档 §4.1）。
 
+use std::collections::HashSet;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -68,6 +71,70 @@ pub struct UpstreamConn {
     /// 与 Broker 协商出的 frame_max。
     pub frame_max: u32,
     pub channel_max: u16,
+    /// Broker 上当前打开的 channel。
+    pub open_channels: HashSet<u16>,
+    pub(crate) counter: Option<ConnCounter>,
+}
+
+/// 连接被丢弃时自动减少连接计数，所以任何退出路径都不会漏掉。
+pub struct ConnCounter(Arc<AtomicUsize>);
+
+impl ConnCounter {
+    pub fn new(count: &Arc<AtomicUsize>) -> ConnCounter {
+        count.fetch_add(1, Ordering::Relaxed);
+        ConnCounter(count.clone())
+    }
+}
+
+impl Drop for ConnCounter {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl UpstreamConn {
+    /// 处理连接在池中空闲时已经到达的帧（设计文档 §5.1）。
+    /// 返回 `false` 表示连接已断开或状态不可信，不能再使用。
+    pub async fn poll_idle(&mut self) -> bool {
+        loop {
+            let frame = match self.reader.read_frame().now_or_never() {
+                None => return true,
+                Some(Ok(Some(frame))) => frame,
+                Some(Ok(None)) | Some(Err(_)) => return false,
+            };
+            if frame.kind == FrameType::Heartbeat {
+                continue;
+            }
+            match methods::method_ids(&frame.payload) {
+                Some((methods::CHANNEL, methods::CHANNEL_CLOSE)) => {
+                    self.open_channels.remove(&frame.channel);
+                    let ok = methods::build_channel_close_ok(frame.channel);
+                    if write_frame(&mut self.writer, &ok).await.is_err() {
+                        return false;
+                    }
+                }
+                Some((methods::CHANNEL, methods::CHANNEL_CLOSE_OK)) => {
+                    self.open_channels.remove(&frame.channel);
+                }
+                Some((methods::CONNECTION, methods::CONNECTION_CLOSE)) => {
+                    let _ =
+                        write_frame(&mut self.writer, &methods::build_connection_close_ok()).await;
+                    return false;
+                }
+                other => {
+                    tracing::warn!("Unexpected frame on an idle upstream connection: {other:?}");
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// 礼貌地关闭上游连接。
+    pub async fn close(mut self, reason: &str) {
+        let close = methods::build_connection_close(methods::REPLY_SUCCESS, reason);
+        let _ = write_frame(&mut self.writer, &close).await;
+        let _ = self.writer.shutdown().await;
+    }
 }
 
 /// 所有 TLS 连接共用一个配置，节省内存。
@@ -157,6 +224,8 @@ async fn handshake(stream: BoxIo, creds: &Credentials) -> Result<UpstreamConn, U
         writer,
         frame_max,
         channel_max: tune.channel_max,
+        open_channels: HashSet::new(),
+        counter: None,
     })
 }
 

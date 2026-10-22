@@ -113,7 +113,7 @@ async fn unreachable_broker_makes_the_client_connect_fail() {
 }
 
 #[tokio::test]
-async fn client_close_is_answered_and_the_upstream_connection_is_closed() {
+async fn client_close_is_answered_and_the_upstream_connection_stays_open_for_reuse() {
     let broker = FakeBroker::start().await;
     let proxy = start_proxy(broker.addr).await;
     let (client, conn) = tokio::join!(
@@ -131,11 +131,12 @@ async fn client_close_is_answered_and_the_upstream_connection_is_closed() {
         client.recv_or_eof().await.is_none(),
         "proxy must close the client socket"
     );
-    conn.expect_closed().await;
+    conn.expect_quiet_for(std::time::Duration::from_millis(300))
+        .await;
 }
 
 #[tokio::test]
-async fn abrupt_client_disconnect_closes_the_upstream_connection() {
+async fn abrupt_client_disconnect_leaves_the_clean_upstream_connection_pooled() {
     let broker = FakeBroker::start().await;
     let proxy = start_proxy(broker.addr).await;
     let (client, conn) = tokio::join!(
@@ -144,7 +145,8 @@ async fn abrupt_client_disconnect_closes_the_upstream_connection() {
     );
     let (client, mut conn) = (client.unwrap(), conn);
     client.drop_abruptly();
-    conn.expect_closed().await;
+    conn.expect_quiet_for(std::time::Duration::from_millis(300))
+        .await;
 }
 
 #[tokio::test]

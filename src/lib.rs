@@ -3,6 +3,7 @@ pub mod config;
 pub mod frame;
 pub mod io;
 pub mod methods;
+pub mod pool;
 pub mod server;
 pub mod session;
 pub mod upstream;

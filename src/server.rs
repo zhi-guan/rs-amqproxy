@@ -3,8 +3,10 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
 
@@ -13,12 +15,36 @@ use crate::config::Config;
 use crate::frame::write_frame;
 use crate::io::{BoxIo, configure_tcp};
 use crate::methods;
+use crate::pool::Pool;
 use crate::session;
-use crate::upstream::{self, Target, UpstreamError};
+use crate::upstream::{Target, UpstreamError};
+
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
+struct Shared {
+    pool: Pool,
+    clients: Arc<AtomicUsize>,
+}
 
 pub struct Server {
     listener: TcpListener,
-    target: Arc<Target>,
+    shared: Arc<Shared>,
+}
+
+/// 客户端连接的计数，丢弃时自动减少。
+struct ClientGuard(Arc<AtomicUsize>);
+
+impl ClientGuard {
+    fn new(count: &Arc<AtomicUsize>) -> ClientGuard {
+        count.fetch_add(1, Ordering::Relaxed);
+        ClientGuard(count.clone())
+    }
+}
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Server {
@@ -31,9 +57,13 @@ impl Server {
             port: config.upstream_port,
             tls: config.upstream_tls,
         };
+        let shared = Shared {
+            pool: Pool::new(target, config.idle_connection_timeout),
+            clients: Arc::new(AtomicUsize::new(0)),
+        };
         Ok(Server {
             listener,
-            target: Arc::new(target),
+            shared: Arc::new(shared),
         })
     }
 
@@ -44,13 +74,16 @@ impl Server {
     }
 
     pub async fn run(self) {
+        tokio::spawn(reap_loop(self.shared.clone()));
+        tokio::spawn(stats_loop(self.shared.clone()));
         loop {
             match self.listener.accept().await {
                 Ok((stream, peer)) => {
-                    let target = self.target.clone();
+                    let shared = self.shared.clone();
                     tokio::spawn(async move {
+                        let _guard = ClientGuard::new(&shared.clients);
                         debug!("Client connected: {peer}");
-                        handle_connection(stream, &target).await;
+                        handle_connection(stream, &shared).await;
                         debug!("Client disconnected: {peer}");
                     });
                 }
@@ -64,7 +97,37 @@ impl Server {
     }
 }
 
-async fn handle_connection(stream: TcpStream, target: &Target) {
+async fn reap_loop(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(shared.pool.reap_interval());
+    loop {
+        tick.tick().await;
+        shared.pool.reap().await;
+    }
+}
+
+async fn stats_loop(shared: Arc<Shared>) {
+    let mut tick = tokio::time::interval(STATS_INTERVAL);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        info!(
+            "clients={} upstreams={} rss={}MB",
+            shared.clients.load(Ordering::Relaxed),
+            shared.pool.upstream_count(),
+            rss_mb().map_or_else(|| "?".to_string(), |v| v.to_string()),
+        );
+    }
+}
+
+/// 进程的常驻内存（MB），读取自 /proc/self/status。
+fn rss_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024)
+}
+
+async fn handle_connection(stream: TcpStream, shared: &Shared) {
     if let Err(e) = configure_tcp(&stream) {
         debug!("Cannot configure client socket: {e}");
     }
@@ -76,15 +139,20 @@ async fn handle_connection(stream: TcpStream, target: &Target) {
         }
         Err(e) => return debug!("Client negotiation failed: {e}"),
     };
-    match upstream::connect(target, &creds).await {
+    match shared.pool.borrow(&creds).await {
         Ok(up) => {
             if write_frame(&mut client.writer, &methods::build_open_ok())
                 .await
                 .is_err()
             {
+                // 上游连接还是干净的，直接放回池中。
+                shared.pool.give_back(&creds, up);
                 return;
             }
-            session::run(client, up).await;
+            if let Some(up) = session::run(&mut client, up).await {
+                shared.pool.give_back(&creds, up);
+            }
+            let _ = client.writer.shutdown().await;
         }
         Err(e) => refuse(&mut client, &creds, e).await,
     }
@@ -111,5 +179,5 @@ async fn refuse(client: &mut ClientConn, creds: &Credentials, err: UpstreamError
         }
     };
     let _ = write_frame(&mut client.writer, &close).await;
-    let _ = tokio::io::AsyncWriteExt::shutdown(&mut client.writer).await;
+    let _ = client.writer.shutdown().await;
 }

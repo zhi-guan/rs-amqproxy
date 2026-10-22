@@ -159,6 +159,13 @@ impl BrokerConn {
         send(&mut self.writer, &frame).await;
     }
 
+    /// 在 `d` 时间内没有收到任何帧，也没有被关闭。
+    pub async fn expect_quiet_for(&mut self, d: Duration) {
+        if let Ok(f) = tokio::time::timeout(d, self.recv_or_eof()).await {
+            panic!("expected silence, got {f:?}");
+        }
+    }
+
     pub async fn expect_closed(&mut self) {
         // 代理可能先发 connection.close 再关闭。
         while let Some(f) = self.recv_or_eof().await {
@@ -280,16 +287,31 @@ impl TestClient {
 
     /// 直接断开 TCP 连接（不发 `connection.close`）。
     pub fn drop_abruptly(self) {}
+
+    /// 正常关闭：发送 `connection.close`，等待 `close-ok` 和 EOF。
+    pub async fn close(mut self) {
+        self.send(methods::build_connection_close(200, "bye")).await;
+        let reply = self.recv().await;
+        assert_eq!(
+            ids(&reply),
+            (methods::CONNECTION, methods::CONNECTION_CLOSE_OK)
+        );
+        assert!(self.recv_or_eof().await.is_none());
+    }
 }
 
 // ---------- 代理 ----------
 
 pub async fn start_proxy(upstream: SocketAddr) -> SocketAddr {
+    start_proxy_with_idle(upstream, Duration::from_secs(5)).await
+}
+
+pub async fn start_proxy_with_idle(upstream: SocketAddr, idle: Duration) -> SocketAddr {
     let config = Config {
         listen_address: "127.0.0.1".into(),
         listen_port: 0,
         debug: false,
-        idle_connection_timeout: Duration::from_secs(5),
+        idle_connection_timeout: idle,
         upstream_host: upstream.ip().to_string(),
         upstream_port: upstream.port(),
         upstream_tls: false,
