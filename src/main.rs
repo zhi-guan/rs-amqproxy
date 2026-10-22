@@ -1,6 +1,4 @@
-mod config;
-
-use config::Config;
+use amqproxy::config::Config;
 use tracing::{debug, info};
 
 #[cfg(feature = "jemalloc")]
