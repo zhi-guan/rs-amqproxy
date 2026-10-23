@@ -20,7 +20,8 @@ url = "2.5.8"
 webpki-roots = "1.0.10"
 
 [features]
-# jemalloc 需要本机有 make（musl 构建还需要 musl-tools）。见 ADR-0004。
+default = ["jemalloc"]
+# 默认启用 jemalloc（ADR-0004）。构建它需要 make；没有 make 的机器用 --no-default-features。
 jemalloc = ["dep:tikv-jemallocator"]
 # 需要本机运行 test/docker-compose.yml 里的 RabbitMQ 的集成测试。
 integration = []

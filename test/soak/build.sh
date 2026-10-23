@@ -8,6 +8,6 @@ docker run --rm \
   -v amqproxy-soak-cargo:/usr/local/cargo/registry \
   rust:alpine sh -c '
     apk add --no-cache musl-dev make gcc >/dev/null &&
-    cargo build --release --features jemalloc --target-dir /src/target/soak-build &&
+    cargo build --release --target-dir /src/target/soak-build &&
     chown -R '"$(id -u):$(id -g)"' /src/target/soak-build'
 echo "target/soak-build/release/amqproxy"

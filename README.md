@@ -63,11 +63,13 @@ amqproxy [options] [amqp upstream url]
 ## 构建
 
 ```bash
-cargo build --release                       # 普通构建
-cargo build --release --features jemalloc   # 使用 jemalloc（需要 make）
+# 默认使用 jemalloc，构建需要 gcc 和 make
+cargo build --release
+# 没有 make 的机器：不用 jemalloc
+cargo build --release --no-default-features
 # 静态二进制（需要 musl-tools 和 make）
 rustup target add x86_64-unknown-linux-musl
-cargo build --release --target x86_64-unknown-linux-musl --features jemalloc
+cargo build --release --target x86_64-unknown-linux-musl
 ```
 
 ## 测试
